@@ -1,0 +1,12 @@
+[project]
+name = "flix-marketing-spend"
+version = "1.0.0"
+description = "Daily marketing spend in EUR by date, country, brand and channel (dbt + DuckDB)"
+requires-python = ">=3.11"
+dependencies = [
+    "dbt-core>=1.12,<1.13",
+    "dbt-duckdb>=1.11,<1.12",
+    "duckdb>=2.0,<3",
+]
+[tool.uv]
+package = false

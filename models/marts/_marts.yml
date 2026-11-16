@@ -1,0 +1,33 @@
+version: 2
+
+models:
+  - name: fct_daily_marketing_spend
+    description: >
+      Daily marketing spend in EUR by country, brand and channel. Incremental: each run rebuilds the last
+      `lookback_days` spend dates because Google revises costs for several days after the spend date.
+    data_tests:
+      - unique:
+          arguments:
+            column_name: "spend_date || '|' || country || '|' || brand || '|' || channel"
+    columns:
+      - name: spend_date
+        data_tests: [not_null]
+      - name: country
+        description: Derived from the account domain via the domain_country seed; UNKNOWN when unmapped.
+        data_tests: [not_null]
+      - name: brand
+        data_tests: [not_null]
+      - name: channel
+        data_tests: [not_null]
+      - name: spend_eur
+        data_tests: [not_null]
+      - name: campaign_count
+        data_tests: [not_null]
+      - name: last_extracted_at
+        description: >
+          Newest LAST_EXTRACTED_AT among the cost rows behind this row. Shows how fresh the number is and is
+          compared with the source by tests/warn_source_newer_than_mart.sql.
+        data_tests: [not_null]
+
+  - name: export_daily_spend_eur
+    description: CSV export of the mart for stakeholders (output/daily_spend_eur.csv).

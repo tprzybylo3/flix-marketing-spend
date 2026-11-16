@@ -1,0 +1,170 @@
+version: 2
+
+models:
+  - name: int_google_ads__costs_latest
+    description: >
+      Latest extraction per campaign-day. Later extractions are partial, so a campaign missing from a newer
+      extraction keeps its last known value. Ties on the same timestamp take the highest cost.
+    data_tests:
+      - unique:
+          arguments:
+            column_name: "spend_date || '|' || account_id || '|' || campaign_id"
+  - name: int_google_ads__costs_eur
+    description: Campaign-day cost converted to EUR with the rate valid at noon UTC of the spend date.
+    data_tests:
+      - unique:
+          arguments:
+            column_name: "spend_date || '|' || account_id || '|' || campaign_id"
+    columns:
+      - name: currency
+        description: Null means the account is missing from account info.
+        data_tests: [not_null]
+      - name: fx_rate
+        description: Null means no FX rate for that currency and day.
+        data_tests: [not_null]
+      - name: brand
+        data_tests: [not_null]
+      - name: channel
+        data_tests: [not_null]
+unit_tests:
+  - name: latest_extraction_wins_per_campaign
+    description: c1 is revised by a later extraction; that later extraction is partial and omits c2, which must keep its earlier value.
+    model: int_google_ads__costs_latest
+    overrides:
+      vars: {latest_grain: campaign}
+    given:
+      - input: ref('stg_google_ads__costs')
+        rows:
+          - {spend_date: 2025-01-01, account_id: a1, campaign_id: c1, extracted_at: "2025-01-03 02:00:00", cost_micros: 100}
+          - {spend_date: 2025-01-01, account_id: a1, campaign_id: c2, extracted_at: "2025-01-03 02:00:00", cost_micros: 50}
+          - {spend_date: 2025-01-01, account_id: a1, campaign_id: c1, extracted_at: "2025-01-05 02:00:00", cost_micros: 200}
+    expect:
+      rows:
+        - {spend_date: 2025-01-01, account_id: a1, campaign_id: c1, cost_micros: 200}
+        - {spend_date: 2025-01-01, account_id: a1, campaign_id: c2, cost_micros: 50}
+
+  - name: account_snapshot_scenario_drops_campaign_missing_from_newer_extraction
+    model: int_google_ads__costs_latest
+    overrides:
+      vars: {latest_grain: account_snapshot}
+    given:
+      - input: ref('stg_google_ads__costs')
+        rows:
+          - {spend_date: 2025-01-01, account_id: a1, campaign_id: c1, extracted_at: "2025-01-03 02:00:00", cost_micros: 100}
+          - {spend_date: 2025-01-01, account_id: a1, campaign_id: c2, extracted_at: "2025-01-03 02:00:00", cost_micros: 50}
+          - {spend_date: 2025-01-01, account_id: a1, campaign_id: c1, extracted_at: "2025-01-05 02:00:00", cost_micros: 200}
+    expect:
+      rows:
+        - {spend_date: 2025-01-01, account_id: a1, campaign_id: c1, cost_micros: 200}
+
+  - name: same_timestamp_tie_takes_highest_cost
+    model: int_google_ads__costs_latest
+    overrides:
+      vars: {tie_break: highest}
+    given:
+      - input: ref('stg_google_ads__costs')
+        rows:
+          - {spend_date: 2025-01-01, account_id: a1, campaign_id: c3, extracted_at: "2025-01-03 02:00:00", cost_micros: 50}
+          - {spend_date: 2025-01-01, account_id: a1, campaign_id: c3, extracted_at: "2025-01-03 02:00:00", cost_micros: 70}
+    expect:
+      rows:
+        - {spend_date: 2025-01-01, account_id: a1, campaign_id: c3, cost_micros: 70}
+
+  - name: converts_foreign_currency_with_rate_of_the_spend_date
+    model: int_google_ads__costs_eur
+    overrides:
+      vars: {fx_method: daily, channel_source: channel_type}
+    given:
+      - input: ref('int_google_ads__costs_latest')
+        rows:
+          - {spend_date: 2025-01-01, account_id: br, campaign_id: c1, cost_micros: 10000000}
+          - {spend_date: 2025-01-02, account_id: br, campaign_id: c1, cost_micros: 10000000}
+          - {spend_date: 2025-01-01, account_id: de, campaign_id: c2, cost_micros: 7500000}
+      - input: ref('stg_google_ads__accounts')
+        rows:
+          - {account_id: br, currency: BRL, brand: FlixBus, channel: nonbrand, domain: br}
+          - {account_id: de, currency: EUR, brand: FlixTrain, channel: mixed, domain: de}
+      - input: ref('domain_country')
+        rows:
+          - {domain: br, country: BR}
+          - {domain: de, country: DE}
+      - input: ref('stg_finance__exchange_rates')
+        rows:
+          - {currency: BRL, base_currency: EUR, valid_from_utc: "2024-12-31 23:00:01", valid_to_utc: "2025-01-01 23:00:01", rate: 5.0}
+          - {currency: BRL, base_currency: EUR, valid_from_utc: "2025-01-01 23:00:01", valid_to_utc: "2025-01-02 23:00:01", rate: 4.0}
+    expect:
+      rows:
+        - {spend_date: 2025-01-01, account_id: br, country: BR, cost_eur: 2.0}
+        - {spend_date: 2025-01-02, account_id: br, country: BR, cost_eur: 2.5}
+        - {spend_date: 2025-01-01, account_id: de, country: DE, cost_eur: 7.5}
+
+  - name: rate_window_boundary_from_inclusive_to_exclusive
+    description: "A window includes its VALID_FROM and excludes its VALID_TO: a spend date whose noon UTC falls exactly on a window change takes the new window's rate."
+    model: int_google_ads__costs_eur
+    overrides:
+      vars: {fx_method: daily, channel_source: channel_type}
+    given:
+      - input: ref('int_google_ads__costs_latest')
+        rows:
+          - {spend_date: 2025-01-01, account_id: br, campaign_id: c1, cost_micros: 10000000}
+          - {spend_date: 2025-01-02, account_id: br, campaign_id: c1, cost_micros: 10000000}
+      - input: ref('stg_google_ads__accounts')
+        rows:
+          - {account_id: br, currency: BRL, brand: FlixBus, channel: nonbrand, domain: br}
+      - input: ref('domain_country')
+        rows:
+          - {domain: br, country: BR}
+      - input: ref('stg_finance__exchange_rates')
+        rows:
+          - {currency: BRL, base_currency: EUR, valid_from_utc: "2025-01-01 12:00:00", valid_to_utc: "2025-01-02 12:00:00", rate: 5.0}
+          - {currency: BRL, base_currency: EUR, valid_from_utc: "2025-01-02 12:00:00", valid_to_utc: "2025-01-03 12:00:00", rate: 4.0}
+    expect:
+      rows:
+        - {spend_date: 2025-01-01, account_id: br, fx_rate: 5.0, cost_eur: 2.0}
+        - {spend_date: 2025-01-02, account_id: br, fx_rate: 4.0, cost_eur: 2.5}
+
+  - name: missing_rate_leaves_fx_rate_null
+    description: "A currency without a rate for the spend date is not converted with a guess: fx_rate and cost_eur stay NULL, so the not_null test on fx_rate fails and blocks the mart."
+    model: int_google_ads__costs_eur
+    overrides:
+      vars: {fx_method: daily, channel_source: channel_type}
+    given:
+      - input: ref('int_google_ads__costs_latest')
+        rows:
+          - {spend_date: 2025-01-01, account_id: pe, campaign_id: c1, cost_micros: 10000000}
+      - input: ref('stg_google_ads__accounts')
+        rows:
+          - {account_id: pe, currency: PEN, brand: FlixBus, channel: nonbrand, domain: pe}
+      - input: ref('domain_country')
+        rows:
+          - {domain: br, country: BR}
+      - input: ref('stg_finance__exchange_rates')
+        rows:
+          - {currency: BRL, base_currency: EUR, valid_from_utc: "2024-12-31 23:00:00", valid_to_utc: "2025-01-01 23:00:00", rate: 5.0}
+    expect:
+      rows:
+        - {spend_date: 2025-01-01, account_id: pe, fx_rate: null, cost_eur: null}
+
+  - name: monthly_average_scenario_uses_mean_rate_of_the_month
+    model: int_google_ads__costs_eur
+    overrides:
+      vars: {fx_method: monthly_average, channel_source: channel_type}
+    given:
+      - input: ref('int_google_ads__costs_latest')
+        rows:
+          - {spend_date: 2025-01-01, account_id: br, campaign_id: c1, cost_micros: 10000000}
+          - {spend_date: 2025-01-02, account_id: br, campaign_id: c1, cost_micros: 10000000}
+      - input: ref('stg_google_ads__accounts')
+        rows:
+          - {account_id: br, currency: BRL, brand: FlixBus, channel: nonbrand, domain: br}
+      - input: ref('domain_country')
+        rows:
+          - {domain: br, country: BR}
+      - input: ref('stg_finance__exchange_rates')
+        rows:
+          - {currency: BRL, base_currency: EUR, valid_from_utc: "2024-12-31 23:00:01", valid_to_utc: "2025-01-01 23:00:01", rate: 5.0}
+          - {currency: BRL, base_currency: EUR, valid_from_utc: "2025-01-01 23:00:01", valid_to_utc: "2025-01-02 23:00:01", rate: 3.0}
+    expect:
+      rows:
+        - {spend_date: 2025-01-01, account_id: br, cost_eur: 2.5}
+        - {spend_date: 2025-01-02, account_id: br, cost_eur: 2.5}

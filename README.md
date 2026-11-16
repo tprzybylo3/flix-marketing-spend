@@ -1,0 +1,229 @@
+# FLIX – Marketing Spend Pipeline
+
+Daily Google Ads spend in **EUR** by **date × country × brand × channel**, built with **dbt + DuckDB**.
+
+> **Result, January 2025:** 93 rows, **€345,950.02** (DE €182,192 · BR €82,658 · HU €81,099) → `output/daily_spend_eur.csv`
+
+| Section | What you find there |
+|---|---|
+| [Quick start](#quick-start) | two commands, outputs, other commands |
+| [Part A – Production design](#part-a--production-design) | architecture, DAG, scheduling, reliability, monitoring, scalability |
+| [Part B – Pipeline](#part-b--pipeline) | data flow, [decisions](#decisions), [incremental logic](#incremental-logic), [data findings](#data-findings), [tests](#tests) |
+| [docs/DATA_QUALITY.md](docs/DATA_QUALITY.md) | the 5 data issues, each with real rows |
+| [docs/SCENARIOS.md](docs/SCENARIOS.md) | the open business rules as dbt variables and their impact on the total |
+
+**Tags used in all three documents:** `DECISION` my choice where the brief is open · `ASSUMPTION` to confirm with Flix · `LIMITATION` known gap · `PROD` what changes in production
+
+---
+
+## Quick start
+
+Requirements: [uv](https://docs.astral.sh/uv/) on a UNIX-like system (`brew install uv` or `pip install uv`).
+
+```bash
+make setup     # creates .venv with the exact versions from uv.lock
+make build     # dbt build: seed, models, data tests, unit tests, CSV export
+```
+
+| Output | Content |
+|---|---|
+| `output/daily_spend_eur.csv` | final dataset for stakeholders |
+| `output/marketing.duckdb` | all layers (`duckdb output/marketing.duckdb`) |
+
+| Command | What it does |
+|---|---|
+| `make full-refresh` | rebuilds every table, ignoring the incremental window |
+| `make test-incremental` | simulates late corrections on a temporary copy and checks the window |
+| `make scenarios` | rebuilds every business-rule scenario and prints the comparison ([SCENARIOS](docs/SCENARIOS.md)) |
+| `make docs` | dbt documentation with the lineage graph |
+| `make docker-build && make docker-run` | runs `dbt build` inside the Docker image |
+| `make clean` | removes generated files |
+
+**Why DuckDB:** the brief allows a local database such as SQLite; DuckDB is the same idea (one file, no server) with a maintained dbt adapter. Models are plain SQL; only the sources (`external_location` reading CSVs) are DuckDB-specific. **Versions:** `uv.lock` pins all 63 packages, so laptop, CI and Docker run identical versions.
+
+---
+
+## Part A – Production design
+
+> **Design only.** Of this part, the repository contains only the `dbt_build` step (`dags/marketing_spend_dag.py`, not executed). Extraction, loading, the FX sensor, monitoring and alerting are not built.
+
+Solid arrows are data; dotted arrows are control (Airflow starting tasks) and observation (monitoring).
+
+```mermaid
+flowchart LR
+    GA[Google Ads API] --> EX
+    FXS[FX rates e.g. ECB] --> EXF
+    META[Account metadata<br/>owned by Marketing] --> EXM
+    subgraph ingest[Ingestion, daily]
+      EX[Google Ads extractor<br/>one task per account]
+      EXF[FX extractor]
+      EXM[Metadata sync]
+    end
+    EX --> RAW[(S3 raw<br/>append-only, one folder<br/>per extraction day)]
+    EXF --> RAW
+    EXM --> RAW
+    RAW --> WH[(Snowflake)]
+    subgraph dbt
+      STG[staging<br/>rename, types] --> INT[intermediate<br/>latest version, EUR] --> MART[marts<br/>daily spend,<br/>last 14 days rebuilt]
+    end
+    WH --> STG
+    MART --> BI[BI dashboards]
+
+    AF{{Airflow}} -.->|schedule, retries| ingest
+    AF -.->|dbt build after the FX sensor| dbt
+    dbt -.->|test results| MON{{Monitoring and alerts<br/>freshness, volume, Slack}}
+    AF -.->|run status| MON
+```
+
+Proposed daily DAG (only `dbt_build` exists in the repo):
+
+```mermaid
+flowchart LR
+    A[extract_google_ads<br/>one task per account] --> L[load_raw_to_warehouse]
+    B[extract_fx] --> L
+    C[sync_account_metadata] --> L
+    L --> S{{wait_for_fx<br/>sensor: rate for the run date exists}}
+    S --> D[dbt_build<br/>run_date = ds, 14-day window]
+    D --> N[alert on failure or warnings]
+```
+
+| Area | Design |
+|---|---|
+| **Scheduling** | Daily after Google finalises the previous day. Each run rebuilds a **14-day lookback** with idempotent delete+insert or MERGE per date; a backfill is the same job with a date range. A sensor waits for the day's FX rate instead of converting with a missing one. |
+| **Late corrections** | `warn_source_newer_than_mart` compares extraction timestamps and reads only newly loaded partitions → backfill of the listed dates. `warn_mart_drift_at_full_grain` compares amounts: last 40 days on every run, the whole history when model logic or the account mapping changes (part of that deploy). Later: with `_loaded_at`, reprocess exactly the dates that received new rows. |
+| **Reliability** | Raw layer append-only and immutable, so any day can be replayed. The extractor adds `try_number` and `request_seq` to each row, so "latest" is always unique ([what the source should add](docs/DATA_QUALITY.md#what-the-source-should-add)). API calls retry with backoff, per account, so one failure does not block the rest. Schema contracts at ingestion; dbt tests gate publication. |
+| **Retries** | `LIMITATION` the repo DAG retries a failed run twice, also when it failed on a data test, which fails again on every retry and only delays the alert. `PROD` retry only technical failures (dbt exit code 2: crash, lost connection), never failed tests (exit code 1). |
+| **Load metadata** | Every raw row should carry the file it came from and its load time (`_loaded_at`), to find and reload a bad delivery. |
+| **Monitoring** | Freshness SLA on the mart (e.g. D-1 by 07:00), `dbt source freshness`, volume and spend anomalies per account, test history (e.g. elementary), weekly reconciliation with the Google Ads UI or invoices. An "account stopped spending" check needs account and campaign status (ENABLED, PAUSED, REMOVED) from the API; the sample has no such case, so it is not built. |
+| **Alerts** | `on_failure_callback` to Slack; a task after `dbt build` reads warnings from `target/run_results.json` and posts a daily summary. |
+| **Deployment** | Terraform for buckets, IAM, secrets, Airflow; pipeline as a Docker image; CI runs `dbt build` on a dev schema per PR. Account → country/brand/channel mapping owned by Marketing as a tested SCD2 table. |
+
+**Scalability**
+- **Volume:** one row = one campaign on one day in one extraction, so data grows with the number of accounts and campaigns, not with clicks. Example: 1,000 accounts × 50 campaigns × 30 days × 2 versions ≈ 3 million rows a month, small for Snowflake.
+- **Daily cost does not grow with history:** each run rebuilds only the last 14 dates of the mart and compares only the last 40 days for drift; older dates are not touched.
+- **Identified in dbt:** most build time goes to data tests, not models; on a view each test recomputes the dedup and FX join. So `int_*` are **tables**, computed once per run. A table still recomputes the whole history daily; `PROD` incremental `int` on campaign-day with the same window, data tests limited to the window (`config: where`), full tests on full refresh, raw partitioned by extraction date and clustered by spend date.
+
+---
+
+## Part B – Pipeline
+
+```mermaid
+flowchart TB
+    MK[make build<br/>runs dbt build] --> PARSE[dbt reads all models, tests and settings<br/>and orders them by their dependencies]
+    subgraph src["data/ – raw CSV, read via _sources.yml"]
+        RC[raw_costs]
+        AI[account_info]
+        FX[exchange_rates]
+    end
+    SEED[seeds/domain_country.csv]
+    subgraph stg["staging – typing, renaming, FX windows to UTC"]
+        SC[stg_google_ads__costs]
+        SA[stg_google_ads__accounts]
+        SX[stg_finance__exchange_rates]
+    end
+    subgraph int["intermediate – business rules"]
+        L[int_google_ads__costs_latest<br/>latest extraction per campaign-day]
+        E[int_google_ads__costs_eur<br/>FX conversion, account attributes, country]
+    end
+    subgraph mart["marts"]
+        F[fct_daily_marketing_spend<br/>incremental, date × country × brand × channel]
+        O[export_daily_spend_eur<br/>output/daily_spend_eur.csv]
+    end
+    RC --> SC --> L --> E
+    AI --> SA --> E
+    FX --> SX --> E
+    SEED --> E
+    E --> F --> O
+    PARSE -->|dbt build in graph order,<br/>tests right after each model| src
+    PARSE --> SEED
+```
+
+**`make build`** runs 54 nodes in graph order: 1 seed, 7 models, 8 unit tests (before their model), 38 data tests (after their model). **An error test skips everything downstream**, so the mart and the CSV keep the last good data (e.g. a missing BRL rate fails `not_null_int_google_ads__costs_eur_fx_rate` and the mart is not rebuilt).
+
+| Model | Materialised as | Why | In production (Snowflake, years of data) |
+|---|---|---|---|
+| `stg_*` | view | rename and cast only; no second copy | same |
+| `int_*` | table, rebuilt in full on every run | data tests read the result instead of recomputing the dedup and FX join | incremental, rebuilding only the last 14 spend dates: a full rebuild would re-read years of raw data every day, while only recent dates can change |
+| `fct_daily_marketing_spend` | incremental (`delete+insert` on `spend_date`) | corrections arrive for up to 9 days | same: each run deletes the last 14 dates and inserts them recalculated |
+| `export_daily_spend_eur` | CSV file | the brief asks for a file or local database | BI reads the table directly; a file export stays for teams that need one (e.g. to S3) |
+
+### Decisions
+
+Every open rule is a dbt variable with tested alternatives ([SCENARIOS](docs/SCENARIOS.md)). The defaults are set under `vars:` in `dbt_project.yml`: change them there, or for a single run with `dbt build --vars '{tie_break: lowest}'`. A value outside the allowed list stops the build at compile time (`macros/allowed_var.sql`), so a typo cannot silently switch the rule.
+
+| Topic | Rule | Why |
+|---|---|---|
+| **Latest entry** `DECISION` | newest `LAST_EXTRACTED_AT` **per campaign-day** (spend date × account × campaign); versions are never summed | the brief says each *campaign* is extracted multiple times, and each campaign has its own extraction times. The trap, newest extraction per account-day, loses 42% of spend ([Q1](docs/SCENARIOS.md#q1-grain-of-the-latest-entry)) |
+| **Ties** `ASSUMPTION` | 103 campaign-days with two costs at the same timestamp: take the **higher** | conservative, never understates spend; 0.5% of the total; every case reported by `warn_same_timestamp_conflicts` ([DQ #2](docs/DATA_QUALITY.md#2-same-timestamp-ties)) |
+| **FX** | `BASE = EUR`, `RATE` = currency per 1 EUR (BRL ≈ 6.1–6.4 in January) → `EUR = local / RATE`; EUR accounts use 1 | rate valid at **noon UTC** of the spend date: windows start 00:00:01 CET, noon avoids midnight and DST off-by-one |
+| **Country** `ASSUMPTION` | from account `DOMAIN` via `seeds/domain_country.csv`; unmapped → `UNKNOWN` + warning | no country column in the source. `PROD` block or quarantine instead of `UNKNOWN` |
+| **Brand / channel** | `BRAND`, `CHANNEL_TYPE` from account info | `AD_PLATFORM` is Google for all spending accounts ([Q4](docs/SCENARIOS.md#q4-channel)) |
+| **Grain** | date × country × brand × channel + `campaign_count` + `last_extracted_at` | `last_extracted_at` shows how fresh a number is; amounts rounded after aggregation |
+
+### Incremental logic
+
+`DECISION` The brief only says the latest entry is the most accurate. Making the mart incremental is my choice, so a daily run rebuilds only dates that can still change.
+
+| Run | Dates rebuilt |
+|---|---|
+| Daily (Airflow passes `run_date = ds`) | `run_date` and the 13 dates before it; never dates after `run_date` |
+| Without `run_date` | the newest date in the mart and the 13 dates before it, plus any newer dates in the source |
+| First run after missed runs | from 12 days before the newest date in the mart up to `run_date`: the missed dates are filled without a backfill |
+| Backfill | `dbt build --vars '{run_date: "2025-01-20", lookback_days: 30}'` |
+| Full rebuild | `make full-refresh` |
+
+- **Key = `spend_date`, not the full grain.** A run replaces whole dates, so reruns are idempotent; with a full-grain key, a group that disappears (an account moved to another brand) would keep its old row and be counted twice.
+- **Why 14 days** `ASSUMPTION` corrections arrive up to 9 days late (10 for one shifted date), seen only on spend dates 1–15 January; +1 day for the window boundary, +1 if `ds` trails the run (Airflow 2 default), plus margin for a yearly worst case ([details](docs/DATA_QUALITY.md#1c-how-late-corrections-arrive-the-14-day-window)).
+- **Older corrections are not applied, but detected:**
+
+| Test (warn) | Compares | Catches |
+|---|---|---|
+| `warn_source_newer_than_mart` | each date's newest source extraction vs the mart's `last_extracted_at` | a late correction outside the window; cheap, timestamps only |
+| `warn_mart_drift_at_full_grain` | every mart row vs a fresh aggregation. It runs in every `dbt build`; `drift_check_days` limits it to the last N days: 40 in the daily DAG (`dags/marketing_spend_dag.py`), the whole history when unset (`dbt_project.yml`) | any change in amounts without a new extraction: revised FX rate, reassigned account, changed logic |
+
+- **Why 40 days** `ASSUMPTION` Finance closes a month in the first days of the next one; on 9 February the last 40 days still cover all of January, so a difference in the month is reported before it is closed. Fewer days (e.g. 35) would drop early January by 5 February; checking 40 instead of 35 days costs almost nothing. The close date should be confirmed with Finance.
+- `LIMITATION` a date that disappears entirely from the source keeps its old rows until `make full-refresh`; the drift test reports it.
+- `TEST` `scripts/test_incremental.sh` (in CI): a correction inside the window is applied, one outside is left untouched and detected, a full refresh repairs it.
+
+### Data findings
+
+3,858 cost rows · 3 accounts with spend (DE FlixTrain EUR, HU FlixBus EUR, BR FlixBus BRL) · 304 campaigns · 2,358 campaign-days. Details and real rows: [DATA_QUALITY](docs/DATA_QUALITY.md).
+
+| # | Finding | Size | Handling |
+|---|---|---|---|
+| 1 | Repeated extractions: Google revises costs up to 9 days later; the newest extraction holds only some campaigns | 1,392 campaign-days with 2 versions (spend dates 1–15 Jan) | latest per campaign-day, 14-day window |
+| 2 | Two costs with the same timestamp (`LAST_EXTRACTED_AT` is a batch start) | 103 campaign-days | higher cost, warning |
+| 3 | Spend dates 6–7 Jan from a separate 10:45:35 process | 422 rows | no special handling |
+| 4 | Extracted before the spend date | 334 rows | superseded later; warning |
+| 5 | Exact duplicates | 5 rows | removed by the dedup |
+
+FX table: HRK still listed (Croatia uses EUR since 2023), PEN only from 2025-03-15, rates carried over weekends.
+
+### Tests
+
+| Kind | What | Where |
+|---|---|---|
+| **Generic** | not_null / unique / relationships / accepted_values on keys, currencies, FX and the mart grain; `unique` campaign-day after the FX join, so a bad FX or account row cannot inflate spend | `models/*/_staging.yml`, `_intermediate.yml`, `_marts.yml` |
+| **Error** (stop the build) | source values that do not parse (`assert_source_values_parse`; staging uses `try_cast`, the bad row is stored in `main_dbt_test__audit`) · no negative costs (`assert_no_negative_costs`) · FX rate > 0 and valid_to > valid_from (`assert_fx_rates_valid`) · no overlapping FX windows (`assert_fx_windows_do_not_overlap`) | `tests/assert_*.sql` |
+| **Warn** (report, publish anyway) | same-timestamp ties (`warn_same_timestamp_conflicts`) · extracted before the spend date (`warn_extracted_before_spend_date`, `warn_latest_extraction_before_spend_date`) · unmapped country (`warn_unmapped_country`) · late correction outside the window (`warn_source_newer_than_mart`) · mart drift (`warn_mart_drift_at_full_grain`) | `tests/warn_*.sql` |
+| **Unit** (dbt ≥ 1.8) | latest per campaign incl. a campaign missing from a newer extraction · account-snapshot alternative · tie-break · monthly FX · conversion with the right day's rate · rate window start inclusive, end exclusive · missing rate stays NULL · CET (+0100/+0200) → UTC parsing | `unit_tests:` in `models/staging/_staging.yml`, `models/intermediate/_intermediate.yml` |
+| **Integration** | late corrections inside and outside the window, full refresh | `scripts/test_incremental.sh` (`make test-incremental`) |
+
+All dbt tests run inside `make build`; to run only the tests: `uv run dbt test` (or `--select test_type:unit` for the unit tests).
+
+### Orchestration and CI
+
+- **`dags/marketing_spend_dag.py`** daily `dbt build` with `run_date = {{ ds }}`, 14-day lookback, `drift_check_days: 40`, retries; Airflow 3 with `CronTriggerTimetable`, so the run at 03:00 on 10 January has `ds = 2025-01-10` (under Airflow 2's default it would be 9 January; the window covers both). Not executed.
+- **`.github/workflows/ci.yml`** every PR: `dbt parse`, `dbt build`, the incremental test.
+
+---
+
+## What I would do with more time
+
+| Area | Next step |
+|---|---|
+| **Agree with Flix** | tie-break rule; country of `com` and `app` domains; whether `AD_PLATFORM` belongs in the breakdown; what the 10:45:35 process and the pre-spend-date extractions are |
+| **Source** | `try_number` and `request_seq` from the extractor, so ties disappear; raw files in S3 with `_source_file`, `_loaded_at` |
+| **Data quality** | quarantine failing rows instead of stopping the whole build (needs agreement on what may be published partially); freshness and anomaly tests; an `is_final` flag from `last_extracted_at` (a date's value two days after it later moves by −2.6% to +4.9%, 6–7 Jan excluded) |
+| **Modelling** | SCD2 account attributes; a campaign-level fact table for drill-down |
+| **Orchestration** | dbt from the Docker image (`KubernetesPodOperator`) or Cosmos; sensor on raw data instead of a fixed 03:00; MERGE in the warehouse; CI only on changed models (`state:modified+`) |

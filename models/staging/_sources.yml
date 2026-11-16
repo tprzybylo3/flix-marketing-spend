@@ -1,0 +1,19 @@
+version: 2
+sources:
+  - name: google_ads
+    description: Daily Google Ads exports delivered as CSV files.
+    meta:
+      external_location: "read_csv('data/{name}.csv', header = true, all_varchar = true)"
+    tables:
+      - name: de_case_study_anon_raw_costs
+        description: Campaign cost per account and day. Each campaign-day can be extracted several times; the latest extraction is the most accurate.
+      - name: de_case_study_anon_account_info
+        description: Attributes of each ads account.
+
+  - name: finance
+    description: Reference data owned by Finance.
+    meta:
+      external_location: "read_csv('data/{name}.csv', header = true, all_varchar = true)"
+    tables:
+      - name: de_case_study_exchange_rates
+        description: Daily FX rates; RATE = units of CURRENCY per 1 BASE (EUR).

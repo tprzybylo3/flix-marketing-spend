@@ -1,0 +1,61 @@
+version: 2
+
+models:
+  - name: stg_google_ads__costs
+    description: One row per extraction of a campaign-day cost. Duplicates are expected here.
+    columns:
+      - name: spend_date
+        data_tests: [not_null]
+      - name: account_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_google_ads__accounts')
+                field: account_id
+      - name: campaign_id
+        data_tests: [not_null]
+      - name: extracted_at
+        data_tests: [not_null]
+      - name: cost_micros
+        data_tests: [not_null]
+
+  - name: stg_google_ads__accounts
+    columns:
+      - name: account_id
+        data_tests: [unique, not_null]
+      - name: currency
+        data_tests: [not_null]
+
+  - name: stg_finance__exchange_rates
+    columns:
+      - name: currency
+        data_tests: [not_null]
+      - name: base_currency
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['EUR']
+      - name: valid_from_utc
+        data_tests: [not_null]
+      - name: valid_to_utc
+        data_tests: [not_null]
+      - name: rate
+        data_tests: [not_null]
+
+unit_tests:
+  - name: fx_windows_are_parsed_from_local_time_to_utc
+    description: "VALID_FROM / VALID_TO carry a CET offset (+0100 in winter, +0200 after the switch to summer time on 30 March); staging converts both to UTC and keeps the 00:00:01 boundary."
+    model: stg_finance__exchange_rates
+    given:
+      - input: source('finance', 'de_case_study_exchange_rates')
+        # format: sql because the source is a CSV read at query time, so dbt cannot look up its column types
+        format: sql
+        rows: |
+          select 'brl' as CURRENCY, 'eur' as BASE, '2025-01-05 00:00:01.000 +0100' as VALID_FROM, '2025-01-06 00:00:01.000 +0100' as VALID_TO, '6.3478' as RATE
+          union all
+          select 'TRY', 'EUR', '2025-03-30 00:00:01.000 +0100', '2025-03-31 00:00:01.000 +0200', '41.0387'
+    expect:
+      rows:
+        - {currency: BRL, base_currency: EUR, valid_from_utc: "2025-01-04 23:00:01", valid_to_utc: "2025-01-05 23:00:01", rate: 6.3478}
+        - {currency: TRY, base_currency: EUR, valid_from_utc: "2025-03-29 23:00:01", valid_to_utc: "2025-03-30 22:00:01", rate: 41.0387}

@@ -1,0 +1,32 @@
+name: flix_marketing_spend
+version: "1.0.0"
+profile: flix_marketing_spend
+
+flags:
+  send_anonymous_usage_stats: false
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+vars:
+  lookback_days: 14
+  drift_check_days: null
+  latest_grain: campaign
+  tie_break: highest
+  channel_source: channel_type
+  fx_method: daily
+models:
+  flix_marketing_spend:
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: table
+    marts:
+      +materialized: table
+seeds:
+  flix_marketing_spend:
+    domain_country:
+      +column_types:
+        domain: varchar
+        country: varchar

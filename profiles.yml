@@ -1,0 +1,7 @@
+flix_marketing_spend:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: output/marketing.duckdb
+      threads: 4

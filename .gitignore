@@ -1,0 +1,8 @@
+target/
+dbt_packages/
+logs/
+.venv/
+output/*.duckdb*
+.user.yml
+.DS_Store
+.vscode/
