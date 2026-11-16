@@ -18,9 +18,11 @@ Daily Google Ads spend in **EUR** by **date × country × brand × channel**, bu
 
 ## Quick start
 
-Requirements: [uv](https://docs.astral.sh/uv/) on a UNIX-like system (`brew install uv` or `pip install uv`).
+Requirements: uv on a UNIX-like system (`brew install uv` or `pip install uv`).
 
 ```bash
+git clone https://github.com/tprzybylo3/flix-marketing-spend.git
+cd flix-marketing-spend
 make setup     # creates .venv with the exact versions from uv.lock
 make build     # dbt build: seed, models, data tests, unit tests, CSV export
 ```
