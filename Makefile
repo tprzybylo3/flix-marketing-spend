@@ -1,6 +1,7 @@
 .PHONY: setup build full-refresh test-incremental scenarios docs docker-build docker-run clean
 
 export DBT_PROFILES_DIR := .
+DOCS_PORT ?= 8580
 
 setup:
 	uv sync --locked
@@ -18,7 +19,7 @@ scenarios:
 	uv run ./scripts/compare_scenarios.sh
 
 docs:
-	uv run dbt docs generate && uv run dbt docs serve
+	uv run dbt docs generate && uv run dbt docs serve --port $(DOCS_PORT)
 
 docker-build:
 	docker build -t flix-marketing-spend .

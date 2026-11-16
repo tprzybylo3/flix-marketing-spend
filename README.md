@@ -37,7 +37,7 @@ make build     # dbt build: seed, models, data tests, unit tests, CSV export
 | `make full-refresh` | rebuilds every table, ignoring the incremental window |
 | `make test-incremental` | simulates late corrections on a temporary copy and checks the window |
 | `make scenarios` | rebuilds every business-rule scenario and prints the comparison ([SCENARIOS](docs/SCENARIOS.md)) |
-| `make docs` | dbt documentation with the lineage graph |
+| `make docs` | dbt documentation with the lineage graph, at http://localhost:8580 (other port: `make docs DOCS_PORT=9000`) |
 | `make docker-build && make docker-run` | runs `dbt build` inside the Docker image |
 | `make clean` | removes generated files |
 
