@@ -16,6 +16,8 @@ trap 'rm -rf "$WORK"' EXIT
 
 cd "$SRC"
 tar --exclude=./.venv --exclude=./target --exclude=./logs --exclude='./output/*' -cf - . | tar -xf - -C "$WORK"
+# macOS tar also drops the output/ folder itself, so recreate it for the DuckDB file
+mkdir -p "$WORK/output"
 cd "$WORK"
 export DBT_PROFILES_DIR=.
 spend() {

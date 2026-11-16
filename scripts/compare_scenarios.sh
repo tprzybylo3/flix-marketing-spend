@@ -23,6 +23,7 @@ for entry in "${SCENARIOS[@]}"; do
   name="${entry%%|*}"; vars="${entry#*|}"
   work="$(mktemp -d)"
   (cd "$SRC" && tar --exclude=./.venv --exclude=./target --exclude=./logs --exclude='./output/*' -cf - .) | tar -xf - -C "$work"
+  mkdir -p "$work/output"
   status=$(cd "$work" && DBT_PROFILES_DIR=. "$DBT" build --quiet --vars "$vars" >/dev/null 2>&1 && echo pass || echo FAIL)
   (cd "$work" && "$PY" - "$name" "$vars" "$status" <<'PY'
 import sys, duckdb
